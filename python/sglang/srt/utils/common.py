@@ -185,6 +185,11 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
+@lru_cache(maxsize=1)
+def mem_fraction_static_of_total() -> bool:
+    return os.getenv("SGLANG_MEM_FRACTION_STATIC_OF_TOTAL", "0") == "1"
+
+
 def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
@@ -491,6 +496,30 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
+def get_cpu_memory():
+    memory_total = psutil.virtual_memory().total
+    memory_avail = psutil.virtual_memory().available
+
+    if sys.platform == "linux":
+        cgroup_usage, cgroup_total = None, "max"
+        for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+            if os.path.exists(path):
+                with open(path) as file:
+                    cgroup_usage = file.read()
+        for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            if os.path.exists(path):
+                with open(path) as file:
+                    cgroup_total = file.read()
+        # On cgroup v2 no limit is "max" and on v1 it is just extremely high
+        if cgroup_total == "max" or int(cgroup_total) > 2**56:
+            cgroup_total = None
+        if cgroup_usage and cgroup_total:
+            memory_avail = int(cgroup_usage)
+            memory_total = int(cgroup_total)
+
+    return memory_avail, memory_total
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -516,9 +545,9 @@ def get_available_gpu_memory(
             # only reports "free" memory, which can be lower than what is actually
             # available due to not including cache memory. So we use the system available
             # memory metric instead.
-            free_gpu_memory = psutil.virtual_memory().available
+            total_gpu_memory, free_gpu_memory = get_cpu_memory()
         else:
-            free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+            free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
@@ -550,9 +579,10 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = psutil.virtual_memory().available
+        free_cpu_memory, total_cpu_memory = get_cpu_memory()
         n_numa_node: int = len(get_cpu_ids_by_node())
-        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
+        free_gpu_memory = round(free_cpu_memory / n_numa_node, 3)
+        total_gpu_memory = round(total_cpu_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -565,6 +595,9 @@ def get_available_gpu_memory(
         if empty_cache:
             torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+
+    if mem_fraction_static_of_total():
+        free_gpu_memory = total_gpu_memory
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
