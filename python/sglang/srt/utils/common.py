@@ -528,7 +528,7 @@ def get_cpu_memory():
         if cgroup_total == "max" or int(cgroup_total) > 2**56:
             cgroup_total = None
         if cgroup_usage and cgroup_total:
-            memory_avail = int(cgroup_usage)
+            memory_avail = int(cgroup_total) - int(cgroup_usage)
             memory_total = int(cgroup_total)
 
     return memory_avail, memory_total
